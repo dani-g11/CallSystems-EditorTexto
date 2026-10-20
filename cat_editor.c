@@ -414,3 +414,208 @@ Linea *abrir_archivo(const char *nombre, int *fd_salida) {
     return cabeza;
 }
 
+/**
+ * Muestra la lista de subcomandos disponibles dentro del editor.
+ */
+void ayuda_editor(void) {
+    printf(COLOR_TITLE "\n--- Comandos del editor de texto ---\n" COLOR_RESET);
+    printf("  " COLOR_PROMPT "o [archivo]" COLOR_RESET "      Abre o crea un archivo y carga su contenido.\n");
+    printf("  " COLOR_PROMPT "a [texto]" COLOR_RESET "        Agrega una línea al final.\n");
+    printf("  " COLOR_PROMPT "p" COLOR_RESET "                Imprime todo el documento.\n");
+    printf("  " COLOR_PROMPT "p [n]" COLOR_RESET "            Imprime solo la línea n.\n");
+    printf("  " COLOR_PROMPT "d [n]" COLOR_RESET "            Elimina la línea n.\n");
+    printf("  " COLOR_PROMPT "i [n] [texto]" COLOR_RESET "    Inserta texto en la posición n.\n");
+    printf("  " COLOR_PROMPT "s [palabra]" COLOR_RESET "      Busca una palabra en el documento.\n");
+    printf("  " COLOR_PROMPT "h" COLOR_RESET "                Muestra esta ayuda.\n");
+    printf("  " COLOR_PROMPT "q" COLOR_RESET "                Guarda, cierra y vuelve al shell.\n\n");
+}
+
+/* ====================================================================================
+ * SEPARADOR DE ARGUMENTOS DENTRO DEL EDITOR
+ * ==================================================================================== */
+
+/**
+ * Separa la línea del editor en: comando (primera palabra) y "resto" (lo que sigue).
+ * Ejemplo: "i 2 Hola mundo"  ->  comando='i', numero_texto apunta a "2 Hola mundo".
+ *
+ * Devolvemos el resto SIN partir, porque comandos como 'a' e 'i' necesitan conservar
+ * los espacios del texto del usuario tal cual los escribió.
+ */
+static char *saltar_espacios(char *p) {
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    return p;
+}
+
+/* ====================================================================================
+ * COMANDO PRINCIPAL: editor
+ * ====================================================================================
+ * Este es el "handler" que el shell llama cuando el usuario escribe:
+ *     editor            (abre el editor sin archivo)
+ *     editor notas.txt  (abre el editor y carga notas.txt)
+ *
+ * Abre un sub-REPL propio con el prompt "editor> " hasta que el usuario escribe 'q'.
+ */
+int cmd_editor(int argc, char **argv) {
+    Linea *cabeza = NULL;     /* cabeza de la lista enlazada (el documento en memoria) */
+    int fd = -1;              /* descriptor del archivo abierto (-1 = ninguno) */
+    char nombre[256] = "";    /* nombre del archivo actualmente abierto */
+    char linea[EDITOR_MAX_LINEA];
+
+    printf(COLOR_TITLE "\n=== Editor de texto (lista enlazada) ===\n" COLOR_RESET);
+    printf(COLOR_INFO "Escribe 'h' para ver los comandos, 'q' para salir.\n" COLOR_RESET);
+
+    /* Si el usuario pasó un archivo (editor notas.txt), abrirlo de una vez */
+    if (argc > 1) {
+        cabeza = abrir_archivo(argv[1], &fd);
+        if (fd != -1) {
+            strncpy(nombre, argv[1], sizeof(nombre) - 1);
+            nombre[sizeof(nombre) - 1] = '\0';
+            printf(COLOR_RESULT "Archivo '%s' abierto (%d líneas).\n" COLOR_RESET,
+                   nombre, contar_lineas(cabeza));
+        }
+    }
+
+    /* ------------------------- Bucle REPL del editor ------------------------- */
+    while (1) {
+        printf(COLOR_PROMPT "editor> " COLOR_RESET);
+        fflush(stdout);
+
+        if (fgets(linea, sizeof(linea), stdin) == NULL) {
+            printf("\n"); /* Ctrl+D: salir del editor */
+            break;
+        }
+
+        /* Quitar el salto de línea final que deja fgets */
+        linea[strcspn(linea, "\n")] = '\0';
+
+        /* La primera letra (ignorando espacios) es el comando */
+        char *p = saltar_espacios(linea);
+        if (*p == '\0') {
+            continue; /* línea vacía: pedir otro comando */
+        }
+
+        char comando = *p;
+        /* "resto" es lo que viene después del comando y de los espacios */
+        char *resto = saltar_espacios(p + 1);
+
+        /* ----------------------------- q: salir ----------------------------- */
+        if (comando == 'q') {
+            break;
+        }
+        /* ----------------------------- h: ayuda ----------------------------- */
+        else if (comando == 'h') {
+            ayuda_editor();
+        }
+        /* -------------------------- o: abrir archivo ------------------------- */
+        else if (comando == 'o') {
+            if (*resto == '\0') {
+                printf(COLOR_ERROR "Uso: o [archivo]\n" COLOR_RESET);
+                continue;
+            }
+            /* Cerrar el archivo anterior y liberar la lista actual (evita fugas) */
+            if (fd != -1) {
+                LOG_SYSCALL("close", "%d", fd);
+                LOG_SYSCALL_RESULT(close(fd));
+                fd = -1;
+            }
+            liberar_lista(&cabeza);
+
+            cabeza = abrir_archivo(resto, &fd);
+            if (fd != -1) {
+                strncpy(nombre, resto, sizeof(nombre) - 1);
+                nombre[sizeof(nombre) - 1] = '\0';
+                printf(COLOR_RESULT "Archivo '%s' abierto (%d líneas).\n" COLOR_RESET,
+                       nombre, contar_lineas(cabeza));
+            }
+        }
+        /* ------------------------ a: agregar al final ------------------------ */
+        else if (comando == 'a') {
+            if (*resto == '\0') {
+                printf(COLOR_ERROR "Uso: a [texto]\n" COLOR_RESET);
+                continue;
+            }
+            agregar_final(&cabeza, resto);
+            guardar_en_disco(fd, cabeza);
+            printf(COLOR_RESULT "Línea agregada.\n" COLOR_RESET);
+        }
+        /* ----------------------------- p: imprimir --------------------------- */
+        else if (comando == 'p') {
+            if (*resto == '\0') {
+                imprimir(cabeza, 0);      /* imprimir todo */
+            } else {
+                imprimir(cabeza, atoi(resto)); /* imprimir una línea */
+            }
+        }
+        /* --------------------------- d: eliminar n --------------------------- */
+        else if (comando == 'd') {
+            if (*resto == '\0') {
+                printf(COLOR_ERROR "Uso: d [n]\n" COLOR_RESET);
+                continue;
+            }
+            int n = atoi(resto);
+            if (eliminar_linea(&cabeza, n)) {
+                guardar_en_disco(fd, cabeza);
+                printf(COLOR_RESULT "Línea %d eliminada.\n" COLOR_RESET, n);
+            } else {
+                printf(COLOR_ERROR "No existe la línea %d.\n" COLOR_RESET, n);
+            }
+        }
+        /* ------------------------- i: insertar en n -------------------------- */
+        else if (comando == 'i') {
+            /* Formato esperado: i [n] [texto]. Primero leemos el número. */
+            if (*resto == '\0') {
+                printf(COLOR_ERROR "Uso: i [n] [texto]\n" COLOR_RESET);
+                continue;
+            }
+            int n = atoi(resto);
+
+            /* Avanzar más allá del número para quedarnos con el texto */
+            char *texto = resto;
+            while (*texto != ' ' && *texto != '\t' && *texto != '\0') {
+                texto++; /* saltar los dígitos del número */
+            }
+            texto = saltar_espacios(texto);
+
+            if (*texto == '\0') {
+                printf(COLOR_ERROR "Uso: i [n] [texto]\n" COLOR_RESET);
+                continue;
+            }
+            if (insertar_en(&cabeza, n, texto)) {
+                guardar_en_disco(fd, cabeza);
+                printf(COLOR_RESULT "Línea insertada en la posición %d.\n" COLOR_RESET, n);
+            } else {
+                printf(COLOR_ERROR "Posición %d inválida (usa de 1 a %d).\n" COLOR_RESET,
+                       n, contar_lineas(cabeza) + 1);
+            }
+        }
+        /* ---------------------------- s: buscar ------------------------------ */
+        else if (comando == 's') {
+            if (*resto == '\0') {
+                printf(COLOR_ERROR "Uso: s [palabra]\n" COLOR_RESET);
+                continue;
+            }
+            buscar(cabeza, resto);
+        }
+        /* ------------------------- comando desconocido ----------------------- */
+        else {
+            printf(COLOR_ERROR "Comando '%c' no reconocido. Escribe 'h' para la ayuda.\n" COLOR_RESET,
+                   comando);
+        }
+    }
+
+    /* ------------------------- Cierre limpio del editor ------------------------- */
+    /* Guardado final (por si quedó algo sin sincronizar) y cierre del descriptor */
+    if (fd != -1) {
+        guardar_en_disco(fd, cabeza);
+        LOG_SYSCALL("close", "%d", fd);
+        LOG_SYSCALL_RESULT(close(fd));
+        fd = -1;
+    }
+    /* Liberar toda la memoria de la lista para no dejar fugas */
+    liberar_lista(&cabeza);
+
+    printf(COLOR_INFO "Saliendo del editor. Volviendo al shell.\n" COLOR_RESET);
+    return 0;
+}
